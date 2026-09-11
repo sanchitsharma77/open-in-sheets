@@ -2,13 +2,31 @@
 #
 # csv2sheet — upload a CSV/TSV to Google Drive as a real Google Sheet, then open it.
 #
-# Usage:  csv2sheet /path/to/file.csv
+# Usage:  csv2sheet [--account LABEL] [--ask] /path/to/file.csv
+#         csv2sheet --list
+#         csv2sheet --doctor
+#
+# Accounts
+#   Configure one line per Google account in ~/.config/csv2sheet/accounts.conf:
+#
+#       Label|rclone-remote|you@example.com
+#
+#   The label is what you pick in the chooser; the remote decides whose Drive
+#   the Sheet is created in; the email is passed to Google as ?authuser= so the
+#   Sheet opens as the right account when you're signed into several at once.
+#
+#   With no accounts.conf, it falls back to a single remote (CSV2SHEET_REMOTE).
+#   With exactly one account, it's used without asking. With several, you get a
+#   chooser — unless --account names one, or CSV2SHEET_ACCOUNT is set.
 #
 # Config (override by exporting these before running):
-#   CSV2SHEET_REMOTE     rclone remote name           (default: gdrive)
+#   CSV2SHEET_ACCOUNT    account label to use, skips the chooser
+#   CSV2SHEET_REMOTE     rclone remote, when not using accounts.conf (default: gdrive)
 #   CSV2SHEET_FOLDER     Drive folder to upload into  (default: CSV to Sheets)
 #   CSV2SHEET_NAME_MODE  timestamp | plain            (default: timestamp)
-#   CSV2SHEET_BROWSER    app name to open the Sheet   (default: Google Chrome)
+#   CSV2SHEET_BROWSER    app name to open the Sheet   (default: your Mac's
+#                        current default browser, resolved fresh on every run —
+#                        change the default in System Settings and this follows)
 #
 # "timestamp" appends the date/time to each Sheet name, so opening the same CSV
 # twice gives you two Sheets and never silently overwrites edits you made.
@@ -16,10 +34,14 @@
 
 set -uo pipefail
 
-REMOTE="${CSV2SHEET_REMOTE:-gdrive}"
+CONF="${CSV2SHEET_CONF:-$HOME/.config/csv2sheet/accounts.conf}"
 FOLDER="${CSV2SHEET_FOLDER:-CSV to Sheets}"
 NAME_MODE="${CSV2SHEET_NAME_MODE:-timestamp}"
-BROWSER="${CSV2SHEET_BROWSER:-Google Chrome}"
+BROWSER="${CSV2SHEET_BROWSER:-}"
+ACCOUNT="${CSV2SHEET_ACCOUNT:-}"
+REMOTE=""
+EMAIL=""
+ASK=0
 
 notify() {
   osascript -e 'on run argv' \
@@ -35,8 +57,192 @@ fail() {
   exit 1
 }
 
+# --- read accounts.conf -------------------------------------------------------
+# Populates parallel arrays LABELS / REMOTES / EMAILS. Blank lines and #comments
+# are skipped; the email field is optional.
+LABELS=(); REMOTES=(); EMAILS=()
+load_accounts() {
+  [ -f "$CONF" ] || return 0
+  local line label remote email
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%%$'\r'}"
+    case "$line" in ''|'#'*) continue ;; esac
+    IFS='|' read -r label remote email <<<"$line"
+    # trim surrounding whitespace on each field
+    label="$(printf '%s' "${label:-}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    remote="$(printf '%s' "${remote:-}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    email="$(printf '%s' "${email:-}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    [ -n "$label" ] && [ -n "$remote" ] || continue
+    LABELS+=("$label"); REMOTES+=("$remote"); EMAILS+=("$email")
+  done <"$CONF"
+}
+
+pick_by_label() {
+  local want="$1" i
+  for i in "${!LABELS[@]}"; do
+    if [ "${LABELS[$i]}" = "$want" ]; then
+      REMOTE="${REMOTES[$i]}"; EMAIL="${EMAILS[$i]}"; ACCOUNT="${LABELS[$i]}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Ask which account, via a native chooser. Cancelling exits quietly.
+choose_account() {
+  local list choice i
+  list=""
+  for i in "${!LABELS[@]}"; do
+    [ -n "$list" ] && list="$list,"
+    list="$list\"$(printf '%s' "${LABELS[$i]}" | sed 's/\\/\\\\/g; s/"/\\"/g')\""
+  done
+  choice="$(osascript \
+      -e "set opts to {$list}" \
+      -e 'tell application "System Events"' \
+      -e '  activate' \
+      -e '  set r to choose from list opts with title "Open in Sheets" with prompt "Which Google account?" default items (item 1 of opts)' \
+      -e 'end tell' \
+      -e 'if r is false then return ""' \
+      -e 'return item 1 of r' 2>/dev/null)"
+  [ -n "$choice" ] || exit 0
+  pick_by_label "$choice" || fail "Unknown account: $choice"
+}
+
+# Report on everything the tool depends on, so a broken setup names itself
+# instead of surfacing later as a failed upload.
+doctor() {
+  local rc=0 i
+  printf 'Open in Sheets — checkup\n\n'
+
+  if command -v rclone >/dev/null 2>&1; then
+    printf '  ok    rclone: %s\n' "$(command -v rclone)"
+  else
+    printf '  FAIL  rclone not installed  ->  brew install rclone\n'; rc=1
+  fi
+
+  if [ -f "$CONF" ]; then
+    printf '  ok    config: %s\n' "$CONF"
+  else
+    printf '  FAIL  no config at %s  ->  run ./setup.sh\n' "$CONF"; rc=1
+  fi
+
+  load_accounts
+  if [ "${#LABELS[@]}" -eq 0 ]; then
+    printf '  FAIL  no accounts configured  ->  run ./setup.sh\n'; rc=1
+  fi
+  for i in "${!LABELS[@]}"; do
+    if ! rclone listremotes 2>/dev/null | grep -qx "${REMOTES[$i]}:"; then
+      printf '  FAIL  %s: no rclone remote "%s"\n' "${LABELS[$i]}" "${REMOTES[$i]}"; rc=1
+    elif ! rclone config show "${REMOTES[$i]}" 2>/dev/null | grep -q '^token = '; then
+      # A remote with no token exists in name only and will fail every upload.
+      printf '  FAIL  %s: remote "%s" has no token, never authorised\n' "${LABELS[$i]}" "${REMOTES[$i]}"; rc=1
+    else
+      printf '  ok    %s -> %s %s\n' "${LABELS[$i]}" "${REMOTES[$i]}" "${EMAILS[$i]:+(${EMAILS[$i]})}"
+      [ -n "${EMAILS[$i]}" ] || printf '  warn  %s has no email; Sheets may open as the wrong account\n' "${LABELS[$i]}"
+    fi
+    if [ -d "$HOME/Applications/Open in Sheets (${LABELS[$i]}).app" ]; then
+      printf '  ok    droplet: Open in Sheets (%s).app\n' "${LABELS[$i]}"
+    else
+      printf '  warn  no droplet for %s  ->  re-run ./install.sh\n' "${LABELS[$i]}"
+    fi
+  done
+
+  if [ -d "$HOME/Applications/Open in Sheets.app" ]; then
+    printf '  ok    droplet: Open in Sheets.app\n'
+  else
+    printf '  FAIL  Open in Sheets.app missing  ->  run ./install.sh\n'; rc=1
+  fi
+
+  local handler
+  handler="$(/usr/bin/python3 -c '
+import subprocess,sys
+try:
+    out = subprocess.run(["duti","-x","csv"],capture_output=True,text=True).stdout.strip().splitlines()
+    print(out[0] if out else "")
+except FileNotFoundError:
+    print("?")
+' 2>/dev/null)"
+  case "$handler" in
+    "?") printf '  warn  CSV default handler unknown (install duti to check)\n' ;;
+    *"Open in Sheets"*) printf '  ok    double-click handler: %s\n' "$handler" ;;
+    "")  printf '  warn  no default app for .csv  ->  Finder > Get Info > Open with > Change All\n' ;;
+    *)   printf '  warn  .csv currently opens in: %s\n' "$handler" ;;
+  esac
+
+  local browser
+  browser="$(/usr/bin/python3 -c '
+import plistlib,os
+p=os.path.expanduser("~/Library/Preferences/com.apple.LaunchServices/com.apple.launchservices.secure.plist")
+try:
+    for h in plistlib.load(open(p,"rb")).get("LSHandlers",[]):
+        if h.get("LSHandlerURLScheme")=="https":
+            print(h.get("LSHandlerRoleAll","")); break
+    else: print("Safari (system default)")
+except Exception: print("unknown")
+' 2>/dev/null)"
+  printf '  ok    Sheets will open in: %s\n' "${browser:-system default browser}"
+
+  case ":$PATH:" in
+    *":$HOME/bin:"*) printf '  ok    ~/bin is on your PATH\n' ;;
+    *) printf '  warn  ~/bin not on PATH; use ~/bin/csv2sheet or add it to your shell\n' ;;
+  esac
+
+  printf '\n%s\n' "$([ "$rc" -eq 0 ] && echo 'All good.' || echo 'Problems found — see FAIL lines above.')"
+  return "$rc"
+}
+
+# --- arguments ----------------------------------------------------------------
+FILES=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --account) [ $# -ge 2 ] || fail "--account needs a label"; ACCOUNT="$2"; shift 2 ;;
+    --account=*) ACCOUNT="${1#*=}"; shift ;;
+    --remote)  [ $# -ge 2 ] || fail "--remote needs a name";  REMOTE="$2";  shift 2 ;;
+    --remote=*) REMOTE="${1#*=}"; shift ;;
+    --email)   [ $# -ge 2 ] || fail "--email needs an address"; EMAIL="$2"; shift 2 ;;
+    --email=*) EMAIL="${1#*=}";  shift ;;
+    --ask)     ASK=1; ACCOUNT=""; shift ;;
+    --list)
+      load_accounts
+      if [ "${#LABELS[@]}" -eq 0 ]; then
+        printf 'No accounts configured. Create %s with lines like:\n\n' "$CONF"
+        printf '  Work|gdrive_work|you@company.com\n  Personal|gdrive_personal|you@gmail.com\n'
+      else
+        printf '%-20s %-20s %s\n' "LABEL" "REMOTE" "ACCOUNT"
+        for i in "${!LABELS[@]}"; do
+          printf '%-20s %-20s %s\n' "${LABELS[$i]}" "${REMOTES[$i]}" "${EMAILS[$i]:-–}"
+        done
+      fi
+      exit 0 ;;
+    --doctor) doctor; exit $? ;;
+    -h|--help) sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --) shift; while [ $# -gt 0 ]; do FILES+=("$1"); shift; done ;;
+    -*) fail "Unknown option: $1" ;;
+    *)  FILES+=("$1"); shift ;;
+  esac
+done
+
 command -v rclone >/dev/null 2>&1 || PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 command -v rclone >/dev/null 2>&1 || fail "rclone is not installed. In Terminal, run:  brew install rclone"
+
+[ "${#FILES[@]}" -ge 1 ] || fail "No file was given to open."
+
+# --- resolve which account/remote to use --------------------------------------
+load_accounts
+if [ -z "$REMOTE" ]; then
+  if [ -n "$ACCOUNT" ]; then
+    pick_by_label "$ACCOUNT" || fail "No account labelled \"$ACCOUNT\" in:
+$CONF
+
+Run  csv2sheet --list  to see what's configured."
+  elif [ "${#LABELS[@]}" -gt 1 ] || { [ "${#LABELS[@]}" -eq 1 ] && [ "$ASK" -eq 1 ]; }; then
+    choose_account
+  elif [ "${#LABELS[@]}" -eq 1 ]; then
+    REMOTE="${REMOTES[0]}"; EMAIL="${EMAILS[0]}"; ACCOUNT="${LABELS[0]}"
+  else
+    REMOTE="${CSV2SHEET_REMOTE:-gdrive}"
+  fi
+fi
 
 rclone listremotes 2>/dev/null | grep -qx "${REMOTE}:" \
   || fail "No rclone remote named \"${REMOTE}\" yet.
@@ -44,44 +250,45 @@ rclone listremotes 2>/dev/null | grep -qx "${REMOTE}:" \
 In Terminal, run:
   rclone config create ${REMOTE} drive scope=drive.file
 
-That opens your browser once to connect your Google account."
+That opens your browser once to connect that Google account."
 
-[ $# -ge 1 ] || fail "No file was given to open."
-
-src="$1"
-[ -f "$src" ] || fail "File not found:
+# --- upload each file ---------------------------------------------------------
+upload_one() {
+  local src="$1" base stem ext target listing id url
+  [ -f "$src" ] || fail "File not found:
 $src"
 
-base="$(basename "$src")"
-stem="${base%.*}"
-ext="$(printf '%s' "${base##*.}" | tr '[:upper:]' '[:lower:]')"
-case "$ext" in
-  csv|tsv) ;;
-  txt)     ext="csv" ;;
-  *)       fail "Not a CSV or TSV file:
+  base="$(basename "$src")"
+  stem="${base%.*}"
+  ext="$(printf '%s' "${base##*.}" | tr '[:upper:]' '[:lower:]')"
+  case "$ext" in
+    csv|tsv) ;;
+    txt)     ext="csv" ;;
+    *)       fail "Not a CSV or TSV file:
 $base" ;;
-esac
+  esac
 
-if [ "$NAME_MODE" = "plain" ]; then
-  target="$stem"
-else
-  target="$stem $(date '+%Y-%m-%d %H%M')"
-fi
+  if [ "$NAME_MODE" = "plain" ]; then
+    target="$stem"
+  else
+    target="$stem $(date '+%Y-%m-%d %H%M')"
+  fi
 
-notify "Opening in Sheets" "Uploading ${base}…"
+  notify "Opening in Sheets${ACCOUNT:+ · $ACCOUNT}" "Uploading ${base}…"
 
-rclone mkdir "${REMOTE}:${FOLDER}" >/dev/null 2>&1
+  rclone mkdir "${REMOTE}:${FOLDER}" >/dev/null 2>&1
 
-upload_log="$(rclone copyto "$src" "${REMOTE}:${FOLDER}/${target}.${ext}" \
-                --drive-import-formats "$ext" \
-                --drive-export-formats "$ext" 2>&1)" \
-  || fail "Upload failed.
+  local upload_log
+  upload_log="$(rclone copyto "$src" "${REMOTE}:${FOLDER}/${target}.${ext}" \
+                  --drive-import-formats "$ext" \
+                  --drive-export-formats "$ext" 2>&1)" \
+    || fail "Upload failed${ACCOUNT:+ for account \"$ACCOUNT\"}.
 
 $upload_log"
 
-listing="$(rclone lsjson "${REMOTE}:${FOLDER}" --drive-export-formats "$ext" 2>/dev/null)"
+  listing="$(rclone lsjson "${REMOTE}:${FOLDER}" --drive-export-formats "$ext" 2>/dev/null)"
 
-id="$(printf '%s' "$listing" | /usr/bin/python3 -c '
+  id="$(printf '%s' "$listing" | /usr/bin/python3 -c '
 import json, sys
 target = sys.argv[1]
 try:
@@ -100,9 +307,26 @@ if best and best.get("ID"):
     print(best["ID"])
 ' "$target")"
 
-[ -n "$id" ] || fail "The file uploaded, but the new Sheet could not be located in Drive.
+  [ -n "$id" ] || fail "The file uploaded, but the new Sheet could not be located in Drive.
 
 Check the \"${FOLDER}\" folder in Google Drive."
 
-url="https://docs.google.com/spreadsheets/d/${id}/edit"
-open -a "$BROWSER" "$url" 2>/dev/null || open "$url"
+  url="https://docs.google.com/spreadsheets/d/${id}/edit"
+  # authuser= tells Google which of your signed-in accounts to open this as, so
+  # the Sheet doesn't land on "You need access" when several are logged in.
+  if [ -n "$EMAIL" ]; then
+    url="${url}?authuser=$(printf '%s' "$EMAIL" | sed 's/@/%40/g; s/+/%2B/g')"
+  fi
+
+  # No browser pinned by default: hand the URL to `open` and macOS sends it to
+  # whatever your current default browser is, looked up fresh each time.
+  if [ -n "$BROWSER" ]; then
+    open -a "$BROWSER" "$url" 2>/dev/null || open "$url"
+  else
+    open "$url"
+  fi
+}
+
+for f in "${FILES[@]}"; do
+  upload_one "$f"
+done
