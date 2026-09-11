@@ -1,0 +1,108 @@
+#!/bin/bash
+#
+# csv2sheet — upload a CSV/TSV to Google Drive as a real Google Sheet, then open it.
+#
+# Usage:  csv2sheet /path/to/file.csv
+#
+# Config (override by exporting these before running):
+#   CSV2SHEET_REMOTE     rclone remote name           (default: gdrive)
+#   CSV2SHEET_FOLDER     Drive folder to upload into  (default: CSV to Sheets)
+#   CSV2SHEET_NAME_MODE  timestamp | plain            (default: timestamp)
+#   CSV2SHEET_BROWSER    app name to open the Sheet   (default: Google Chrome)
+#
+# "timestamp" appends the date/time to each Sheet name, so opening the same CSV
+# twice gives you two Sheets and never silently overwrites edits you made.
+# "plain" reuses the same Sheet name, overwriting the previous upload.
+
+set -uo pipefail
+
+REMOTE="${CSV2SHEET_REMOTE:-gdrive}"
+FOLDER="${CSV2SHEET_FOLDER:-CSV to Sheets}"
+NAME_MODE="${CSV2SHEET_NAME_MODE:-timestamp}"
+BROWSER="${CSV2SHEET_BROWSER:-Google Chrome}"
+
+notify() {
+  osascript -e 'on run argv' \
+            -e 'display notification (item 2 of argv) with title (item 1 of argv)' \
+            -e 'end run' -- "$1" "$2" >/dev/null 2>&1
+}
+
+fail() {
+  osascript -e 'on run argv' \
+            -e 'display dialog (item 1 of argv) with title "Open in Sheets" buttons {"OK"} default button 1 with icon caution' \
+            -e 'end run' -- "$1" >/dev/null 2>&1
+  printf 'csv2sheet: %s\n' "$1" >&2
+  exit 1
+}
+
+command -v rclone >/dev/null 2>&1 || PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+command -v rclone >/dev/null 2>&1 || fail "rclone is not installed. In Terminal, run:  brew install rclone"
+
+rclone listremotes 2>/dev/null | grep -qx "${REMOTE}:" \
+  || fail "No rclone remote named \"${REMOTE}\" yet.
+
+In Terminal, run:
+  rclone config create ${REMOTE} drive scope=drive.file
+
+That opens your browser once to connect your Google account."
+
+[ $# -ge 1 ] || fail "No file was given to open."
+
+src="$1"
+[ -f "$src" ] || fail "File not found:
+$src"
+
+base="$(basename "$src")"
+stem="${base%.*}"
+ext="$(printf '%s' "${base##*.}" | tr '[:upper:]' '[:lower:]')"
+case "$ext" in
+  csv|tsv) ;;
+  txt)     ext="csv" ;;
+  *)       fail "Not a CSV or TSV file:
+$base" ;;
+esac
+
+if [ "$NAME_MODE" = "plain" ]; then
+  target="$stem"
+else
+  target="$stem $(date '+%Y-%m-%d %H%M')"
+fi
+
+notify "Opening in Sheets" "Uploading ${base}…"
+
+rclone mkdir "${REMOTE}:${FOLDER}" >/dev/null 2>&1
+
+upload_log="$(rclone copyto "$src" "${REMOTE}:${FOLDER}/${target}.${ext}" \
+                --drive-import-formats "$ext" \
+                --drive-export-formats "$ext" 2>&1)" \
+  || fail "Upload failed.
+
+$upload_log"
+
+listing="$(rclone lsjson "${REMOTE}:${FOLDER}" --drive-export-formats "$ext" 2>/dev/null)"
+
+id="$(printf '%s' "$listing" | /usr/bin/python3 -c '
+import json, sys
+target = sys.argv[1]
+try:
+    items = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+best = None
+for it in items:
+    name = it.get("Name", "")
+    stem = name.rsplit(".", 1)[0] if "." in name else name
+    if stem != target:
+        continue
+    if best is None or it.get("ModTime", "") > best.get("ModTime", ""):
+        best = it
+if best and best.get("ID"):
+    print(best["ID"])
+' "$target")"
+
+[ -n "$id" ] || fail "The file uploaded, but the new Sheet could not be located in Drive.
+
+Check the \"${FOLDER}\" folder in Google Drive."
+
+url="https://docs.google.com/spreadsheets/d/${id}/edit"
+open -a "$BROWSER" "$url" 2>/dev/null || open "$url"
